@@ -52,7 +52,7 @@ async function executeRecall(invocation, resolved) {
     appended = await invocation.agent.runMaintenance(() => {
       return invocation.agent.session.append("user/message", createUserMessage({
         content: [{ type: "text", text: result.text }],
-        source: { kind: "plugin", plugin: "recall", form: "recall" }
+        source: { kind: "plugin:recall", form: "recall" }
       }), {
         surfaceOp: "append",
         sourceEventSeqs: result.hits.map((hit) => hit.seq)

@@ -14,6 +14,7 @@
  *
  * @module dsh-compaction-instant/recall
  */
+import { readEventAt, readSnapshotEvents } from "./session-read.js";
 import { estimateEntryTokens, isCheckpointSource, projectToolResultText, sanitize, truncateTokens } from "./compiler.js";
 
 /** Default total budget for one recall operation, in density-aware tokens. */
@@ -123,7 +124,7 @@ export function expandSelections(selections) {
  */
 export function findCheckpointSeqs(session) {
   const seqs = [];
-  for (const event of session.events) {
+  for (const event of readSnapshotEvents(session)) {
     if (event.type === "user/message" && isCheckpointSource(event.data?.source)) seqs.push(event.seq);
   }
   return seqs;
@@ -154,7 +155,7 @@ export function resolveRecallReference(session, type, id) {
     const match = /^(\d+)$/u.exec(token);
     if (match === null) return { selections: [], errors: [`invalid result reference "${id}" (expected a seq like "3" or "result 3")`] };
     const seq = Number(match[1]);
-    const event = session.events[seq];
+    const event = readEventAt(session, seq);
     if (event === undefined || event.seq !== seq) return { selections: [], errors: [`result seq ${seq} not found in this session`] };
     if (event.type !== "tool/result") return { selections: [], errors: [`seq ${seq} is not a tool result (it is ${event.type})`] };
     return { selections: [{ start: seq, end: seq }], errors: [] };
@@ -164,7 +165,7 @@ export function resolveRecallReference(session, type, id) {
     const bySeq = /^seqs?\s+(\d+)$/iu.exec(token);
     if (bySeq !== null) {
       const seq = Number(bySeq[1]);
-      const event = session.events[seq];
+      const event = readEventAt(session, seq);
       if (event === undefined || event.seq !== seq) return { selections: [], errors: [`checkpoint seq ${seq} not found in this session`] };
       if (!isCheckpointSource(event.data?.source)) return { selections: [], errors: [`seq ${seq} is not a checkpoint node`] };
       return { selections: [{ start: seq, end: seq }], errors: [] };
@@ -209,7 +210,7 @@ export function recallSession(session, selections, config) {
       truncated = true;
       break;
     }
-    const event = session.events[seq];
+    const event = readEventAt(session, seq);
     if (event === undefined || event.seq !== seq) {
       missing += 1;
       entries.push({ seq, text: `[seq ${seq}: not found in this session]` });

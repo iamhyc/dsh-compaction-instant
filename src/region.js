@@ -15,6 +15,7 @@
  *
  * @module dsh-compaction-instant/region
  */
+import { readEventAt, readSnapshotEvents } from "./session-read.js";
 import { CompactionId, ManualCompactionError, compactCheckpointSource, toolPairingBalancedAfter, toolPairingBalancedBefore } from "@deepseek-ai/dsh-compaction";
 import { createUserMessage, errorChain } from "@deepseek-ai/dsh-llm";
 import { randomUUID } from "node:crypto";
@@ -29,105 +30,36 @@ import { frameCheckpoint, joinCompiledEntries } from "./compiler.js";
 export class SurfaceChangedError extends Error {}
 
 /**
- * Turn index of every surface node, read from the log's `turn/start` events.
- * Nodes before the first turn boundary get turn 0; sessions with no turn
- * events at all produce an all-zero map (selection then keeps everything).
- * @param session - session supplying the event log.
- * @param surfaceNodes - current surface sequences.
- * @returns the per-node turn numbers, in surface order.
- */
-function surfaceTurns(session, surfaceNodes) {
-  const turnOfSeq = new Map();
-  let turn = 0;
-  for (const event of session.events ?? []) {
-    if (event.type === "turn/start") turn = event.data.turn;
-    turnOfSeq.set(event.seq, turn);
-  }
-  return surfaceNodes.map((seq) => turnOfSeq.get(seq) ?? 0);
-}
-
-/** First surface index of the turn that contains `index`. */
-function turnStartIndex(turns, index) {
-  const turn = turns[index];
-  let start = index;
-  while (start > 0 && turns[start - 1] === turn) start -= 1;
-  return start;
-}
-
-/**
- * Resolve the next head-anchored range while retaining a recent tail and
- * never splitting an assistant tool-call/result pair.
- *
- * The retained region is selected backward from the latest turn:
- *
- * - `retainTokens` (`> 0`) is an **absolute ceiling**: complete turns are
- *   kept while their total fits, and when even the latest turn alone exceeds
- *   the ceiling the region collapses to the latest node suffix that fits
- *   (then the tool-pair guard may recede one node further). The retained
- *   total never exceeds the ceiling by a whole turn; the balance guard is the
- *   only permitted overshoot. `retainTurns` is the preferred number of whole
- *   turns — it never overrides the ceiling.
- * - `retainTokens` (`0`) keeps exactly `retainTurns` complete recent turns.
+ * Resolve the next head-anchored range while retaining a priced recent tail
+ * and never splitting an assistant tool-call/result pair.
  * @param session - session supplying authoritative current surface positions.
  * @param measurement - unified pressure and surface measurement from the conversation meter.
- * @param retainTurns - preferred complete recent turns kept verbatim (>= 1).
- * @param retainTokens - hard retained-region token ceiling; 0 keeps only the preferred turns.
+ * @param retainTokens - minimum recent tail budget retained verbatim.
  * @returns the inclusive positional seq range to compact, or `null`.
  */
-export function selectCompactableRange(session, measurement, retainTurns, retainTokens) {
+export function selectCompactableRange(session, measurement, retainTokens) {
   const pricedNodes = measurement.nodes;
   if (pricedNodes.length === 0) return null;
   const surfaceNodes = session.surface.nodes;
   if (surfaceNodes.length !== pricedNodes.length || surfaceNodes.some((seq, index) => seq !== pricedNodes[index]?.seq)) throw new Error("compaction: token-meter surface does not match the current session surface");
-  const turns = surfaceTurns(session, surfaceNodes);
-  const lastTurn = turns[turns.length - 1];
-  if (lastTurn === 0) return null;
-  const preferredTurns = Math.max(1, retainTurns);
-  let keepFromIdx;
-  if (retainTokens > 0) {
-    // Absolute ceiling: roll whole turns backward while they fit.
-    let scanIdx = turns.length;
-    let total = 0;
-    let latestWholeIdx;
-    while (scanIdx > 0) {
-      const startIdx = turnStartIndex(turns, scanIdx - 1);
-      let added = 0;
-      for (let index = startIdx; index < scanIdx; index += 1) added += pricedNodes[index].tokens;
-      if (total + added > retainTokens) break;
-      total += added;
-      scanIdx = startIdx;
-    }
-    latestWholeIdx = scanIdx; // first kept node index under the whole-turn rule
-    if (scanIdx === turns.length) {
-      // Even the latest turn exceeds the ceiling: keep the node suffix that
-      // fits inside it (then the balance guard recedes as usual).
-      let nodeTotal = 0;
-      keepFromIdx = turns.length;
-      const latestStart = turnStartIndex(turns, turns.length - 1);
-      for (let index = turns.length - 1; index >= latestStart; index -= 1) {
-        if (nodeTotal + pricedNodes[index].tokens > retainTokens) break;
-        nodeTotal += pricedNodes[index].tokens;
-        keepFromIdx = index;
-      }
-    } else {
-      keepFromIdx = latestWholeIdx;
-    }
-    // Preferred-turn rule: when the ceiling still has room and fewer than
-    // preferredTurns whole turns were kept, additional whole turns already
-    // cannot fit (loop above broke) — nothing more to do.
-    void preferredTurns;
-  } else {
-    const mandatoryTurnFloor = Math.max(0, lastTurn - preferredTurns + 1);
-    keepFromIdx = 0;
-    while (keepFromIdx < turns.length && turns[keepFromIdx] < mandatoryTurnFloor) keepFromIdx += 1;
+  // rc15: 表层 0 号位承载 system prompt 时，压缩范围必须从 1 号位开始（dsh-session 的
+  // assertSystemHeadRewrite 只允许 system/message 恰好覆盖该节点）。
+  const firstIdx = (readEventAt(session, surfaceNodes[0]) || {}).type === "system/message" ? 1 : 0;
+  let accumulated = 0;
+  let keepFromIdx = pricedNodes.length;
+  for (let index = pricedNodes.length - 1; index >= 0; index -= 1) {
+    accumulated += pricedNodes[index].tokens;
+    keepFromIdx = index;
+    if (accumulated >= retainTokens) break;
   }
-  while (keepFromIdx > 0) {
+  if (keepFromIdx <= firstIdx) return null;
+  while (keepFromIdx > firstIdx) {
     if (toolPairingBalancedBefore(session, surfaceNodes[keepFromIdx])) break;
     keepFromIdx -= 1;
   }
-  if (keepFromIdx === 0) return null;
+  if (keepFromIdx <= firstIdx) return null;
   return {
-    start: surfaceNodes[0],
+    start: surfaceNodes[firstIdx],
     end: surfaceNodes[keepFromIdx - 1]
   };
 }
@@ -152,7 +84,7 @@ export function selectCompactableRange(session, measurement, retainTurns, retain
 export async function compactSurfaceRegion(dependencies, session, start, end, agent, options, signal) {
   if (options.owner === null) signal?.throwIfAborted();
   const selection = validateSurfaceRegion(session, start, end);
-  const entryState = inspectCompactionEntryState(session.events);
+  const entryState = inspectCompactionEntryState(readSnapshotEvents(session));
   assertCompactionInactive(entryState.unmatchedCompactionStart, entryState.latestEndSeedSeq, "compaction");
   let owner;
   if (options.owner === null) {
@@ -249,7 +181,7 @@ function assertCompactionInactive(unmatchedCompactionStart, latestEndSeedSeq, st
  * @param stage - operation label included in the busy diagnostic.
  */
 export function assertNoActiveCompaction(session, stage) {
-  const entryState = inspectCompactionEntryState(session.events);
+  const entryState = inspectCompactionEntryState(readSnapshotEvents(session));
   assertCompactionInactive(entryState.unmatchedCompactionStart, entryState.latestEndSeedSeq, stage);
 }
 
@@ -304,24 +236,11 @@ async function compileCompaction(dependencies, prepared, agent, compactionId, so
   // exactly the entries the model sees. The body is joined with separators
   // and wrapped in an adaptive Markdown fence, so the UI renders the whole
   // expansion as one tidy code block even when messages contain markdown.
-  const verb = sourceCommandId === undefined ? "自动压缩" : "手动 /compact";
-  const introLine = `${verb}: 将 ${prepared.shadowedSeqs.length} 个节点 / ~${prepared.shadowedTokenCount} tokens 编译为 ${compiled.entries.length} 条目 / ~${compiled.stats.tokens} tokens`;
-  const headerLine = `## Compiled checkpoint: ${prepared.shadowedSeqs.length} nodes (seqs ${prepared.start}-${prepared.end}, ~${prepared.shadowedTokenCount} tokens) — ${compiled.entries.length} entries, ~${compiled.stats.tokens} tokens compiled`;
-  // Verbatim retention footer: nodes after the compiled span were never
-  // compiled, so they stay in the live surface as original text.
-  const retainedNodes = prepared.measurement.nodes.slice(prepared.endIdx + 1);
-  const retainedTokenCount = retainedNodes.reduce((total, node) => total + node.tokens, 0);
-  const footerLine = retainedNodes.length === 0 ? undefined
-    : `尾部原文保留: ${retainedNodes.length} 节点 / ~${retainedTokenCount} tokens（未被压缩,仍在对话中）`;
-  const bodyEntries = [
-    introLine,
-    headerLine,
-    ...compiled.entries,
-    ...(footerLine === undefined ? [] : [footerLine])
-  ];
-  const summary = [{ type: "text", text: fenceCode(joinCompiledEntries(bodyEntries)) }];
+  const summary = [{ type: "text", text: fenceCode(joinCompiledEntries(compiled.entries)) }];
+  // [dsh-patch] neutral-wording: 标题行不再写 token 计数（token 记账走投影/日志，不进模型可见文本）。
+  const headerLine = `## Compiled checkpoint: ${prepared.shadowedSeqs.length} nodes (seqs ${prepared.start}-${prepared.end}) — ${compiled.entries.length} entries`;
   const checkpointMessage = createUserMessage({
-    content: frameCheckpoint(compiled.entries, headerLine, introLine, footerLine),
+    content: frameCheckpoint(compiled.entries, headerLine),
     source: compactCheckpointSource(compactionId, sourceCommandId)
   });
   const framedTokenCount = dependencies.meter.estimateMessage(checkpointMessage);
@@ -391,8 +310,8 @@ function commitCompactionBody(session, startEvent, compiled) {
   session.append("user/message", checkpointMessage, {
     surfaceOp: {
       op: "replace",
-      start,
-      end
+      startSeq: start,
+      endSeq: end
     },
     sourceEventSeqs: [
       startEvent.seq,

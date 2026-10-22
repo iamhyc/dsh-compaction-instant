@@ -20,7 +20,28 @@ function instantCompactionClientFactory(require) {
   Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 
   var React = require("react");
-  var { createSnapshotStore } = require("@deepseek-ai/dsh-client-runtime/client");
+  /**
+   * Minimal snapshot store shaped for the rc21 slot hooks: a stable current
+   * value, a replace-and-notify setter, and a disposer-returning subscribe.
+   * Implemented locally so the bundle needs only the platform React seed.
+   */
+  function createSnapshotStore(initial) {
+    var value = initial;
+    var listeners = new Set();
+    return {
+      get: function () { return value; },
+      getSnapshot: function () { return value; },
+      set: function (next) {
+        value = next;
+        listeners.forEach(function (listener) { listener(); });
+      },
+      subscribe: function (listener) {
+        listeners.add(listener);
+        return function () { listeners.delete(listener); };
+      },
+      dispose: function () { listeners.clear(); }
+    };
+  }
 
   // ── styles (injected once per page, matching the official cards' tokens) ──
   var css = [
@@ -84,10 +105,8 @@ function instantCompactionClientFactory(require) {
     autoHint: "步骤间按上下文压力自动压缩；关闭后仅手动 /compact。",
     thresholdRatio: "自动压缩比例",
     thresholdRatioHint: "上下文窗口占用达到此比例时触发自动压缩（默认 0.5）。",
-    retainTurns: "保留回合数",
-    retainTurnsHint: "优先保留最近 N 个完整回合（默认 1）。",
-    retainTokens: "保留 token 上限",
-    retainTokensHint: "保留区 token 硬上限：补足回合时永不超出；若最近回合本身就超过它，只保留其中能装下的部分（默认 5120）。",
+    retainRatio: "保留比例",
+    retainRatioHint: "最近历史按 token 比例保留为原文（默认 0.05）。",
     overridden: "已覆盖",
     reset: "重置",
     invalidNumber: "必须是数字",
@@ -109,10 +128,8 @@ function instantCompactionClientFactory(require) {
     autoHint: "Compress automatically between steps by pressure; off means manual /compact only.",
     thresholdRatio: "Auto-compaction ratio",
     thresholdRatioHint: "Triggers automatic compaction at this fraction of the context window (default 0.5).",
-    retainTurns: "Retained turns",
-    retainTurnsHint: "Prefer the last N complete turns (default 1).",
-    retainTokens: "Retained-token ceiling",
-    retainTokensHint: "Hard ceiling for the retained region: turn extension never exceeds it, and if the latest turn alone is bigger, only the part of it that fits is kept (default 5120).",
+    retainRatio: "Retained ratio",
+    retainRatioHint: "Share of recent history kept verbatim by token ratio (default 0.05).",
     overridden: "Overridden",
     reset: "Reset",
     invalidNumber: "Must be a number",
@@ -455,30 +472,17 @@ function instantCompactionClientFactory(require) {
               onReset: function () { props.resetField("thresholdRatio"); }
             }),
             React.createElement(ValueField, {
-              id: "plugin-config-instant-retain-turns",
-              label: t("retainTurns"),
-              hint: t("retainTurnsHint"),
+              id: "plugin-config-instant-retain-ratio",
+              label: t("retainRatio"),
+              hint: t("retainRatioHint"),
               overriddenLabel: t("overridden"),
               resetLabel: t("reset"),
               invalidLabel: t("invalidNumber"),
               numeric: true,
               disabled: !state.writable,
-              ...state.retainTurns,
-              onEdit: function (text) { props.edit("retainTurns", text); },
-              onReset: function () { props.resetField("retainTurns"); }
-            }),
-            React.createElement(ValueField, {
-              id: "plugin-config-instant-retain-tokens",
-              label: t("retainTokens"),
-              hint: t("retainTokensHint"),
-              overriddenLabel: t("overridden"),
-              resetLabel: t("reset"),
-              invalidLabel: t("invalidNumber"),
-              numeric: true,
-              disabled: !state.writable,
-              ...state.retainTokens,
-              onEdit: function (text) { props.edit("retainTokens", text); },
-              onReset: function () { props.resetField("retainTokens"); }
+              ...state.retainRatio,
+              onEdit: function (text) { props.edit("retainRatio", text); },
+              onReset: function () { props.resetField("retainRatio"); }
             }),
             React.createElement(
               "div",
@@ -506,17 +510,16 @@ function instantCompactionClientFactory(require) {
   /** Namespace of the instant-compaction settings section (Host side registers it). */
   var SETTINGS_NAMESPACE = "compaction-instant";
   /** Required services (cordis fiber inject). */
-  var inject = ["slots", "locale", "connection", "remote", "settingsScope"];
+  var inject = ["slots", "locale", "connection", "remote", "configForms"];
 
   function apply(ctx) {
     var t = ctx.locale.bind(NS);
     ctx.effect(function () { return ctx.locale.register(NS, { zh: zh, en: en }); }, "compaction-instant: settings dictionary");
-    var controller = new CardController(ctx.settingsScope.bind({ namespace: SETTINGS_NAMESPACE }), [
+    var controller = new CardController(ctx.configForms.get(SETTINGS_NAMESPACE), [
       numberField("checkpointCap"),
       booleanField("auto"),
       numberField("thresholdRatio"),
-      numberField("retainTurns"),
-      numberField("retainTokens")
+      numberField("retainRatio")
     ]);
     var store = controller.bind(function () {
       var shell = controller.shell();
@@ -525,15 +528,15 @@ function instantCompactionClientFactory(require) {
         checkpointCap: controller.field("checkpointCap"),
         auto: controller.field("auto"),
         thresholdRatio: controller.field("thresholdRatio"),
-        retainTurns: controller.field("retainTurns"),
-        retainTokens: controller.field("retainTokens")
+        retainRatio: controller.field("retainRatio")
       };
     });
-    ctx.slots.inject("settings.plugin.item", function* () {
+    ctx.slots.inject("settings.plugins.tab", function* () {
       yield ctx.slots.register({
-        name: "settings.plugin.item",
-        key: "compaction-instant",
+        name: "settings.plugins.tab",
+        id: "compaction-instant",
         order: 30,
+        label: function () { return t("title"); },
         locale: NS,
         inject: function () {
           return {

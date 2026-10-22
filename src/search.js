@@ -12,6 +12,7 @@
  *
  * @module dsh-compaction-instant/search
  */
+import { readEventAt, readSnapshotEvents } from "./session-read.js";
 import { estimateEntryTokens, sanitize, truncateTokens } from "./compiler.js";
 import { projectMessageText } from "./recall.js";
 
@@ -55,7 +56,7 @@ export function searchSession(session, patternSource, config) {
   const pattern = compileSearchPattern(patternSource);
   const maxHits = config.maxSearchHits;
   const maxTokens = config.maxRecallTokens;
-  const events = session.events;
+  const events = readSnapshotEvents(session);
   const hits = [];
   let totalMatches = 0;
   let budget = maxTokens;
